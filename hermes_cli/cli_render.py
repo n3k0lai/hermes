@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import sys
-import textwrap
 import threading
 import time
 from contextlib import contextmanager, suppress
@@ -934,12 +933,15 @@ def _build_compact_banner() -> str:
     if w < 30:
         return f"\n[{title_color}]{tiny_line}[/] [dim {dim_color}]- Nous Research[/]\n"
 
-    inner = w - 2  # inside the box border
-    bar = "═" * w
+    # ``w`` is the full outer width including corners. Top/bottom rules use
+    # ``inner`` cells between corners so they match content rows
+    # (``║`` + space + text + space + ``║``).
+    inner = w - 2
+    bar = "═" * inner
     content_width = inner - 2
 
-    line1 = line1[:content_width].ljust(content_width)
-    line2 = version_line[:content_width].ljust(content_width)
+    line1 = _pad_to_width(line1, content_width)
+    line2 = _pad_to_width(version_line, content_width)
 
     return (
         f"\n[bold {border_color}]╔{bar}╗[/]\n"
@@ -949,26 +951,152 @@ def _build_compact_banner() -> str:
     )
 
 
+def _display_width(text: str) -> int:
+    """Terminal cell width (wide glyphs / emoji count as more than one codepoint)."""
+    try:
+        from prompt_toolkit.utils import get_cwidth
+        return get_cwidth(text or "")
+    except Exception:
+        return len(text or "")
+
+
+def _pad_to_width(text: str, width: int) -> str:
+    """Pad or truncate ``text`` to exactly ``width`` terminal cells."""
+    width = max(0, int(width))
+    text = text or ""
+    cur = _display_width(text)
+    if cur == width:
+        return text
+    if cur < width:
+        return text + (" " * (width - cur))
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        cw = _display_width(ch)
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out) + (" " * (width - used))
+
+
+def _hard_wrap_cells(text: str, width: int) -> list[str]:
+    """Hard-wrap ``text`` to ``width`` cells without collapsing whitespace."""
+    if width <= 0:
+        return [text or ""]
+    if not text:
+        return [""]
+    lines: list[str] = []
+    buf: list[str] = []
+    used = 0
+    for ch in text:
+        cw = _display_width(ch)
+        if buf and used + cw > width:
+            lines.append("".join(buf))
+            buf, used = [], 0
+        if not buf and cw > width:
+            # Rare: a single glyph wider than the budget; emit alone.
+            lines.append(ch)
+            continue
+        buf.append(ch)
+        used += cw
+    if buf:
+        lines.append("".join(buf))
+    return lines or [""]
+
+
 def _panel_box_width(title: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
     """Stable TUI panel width wide enough for the title and content (incl. borders)."""
     term_cols = shutil.get_terminal_size((100, 20)).columns
-    longest = max([len(title)] + [len(line) for line in content_lines] + [min_width - 4])
+    longest = max(
+        [_display_width(title)]
+        + [_display_width(line) for line in content_lines]
+        + [min_width - 4]
+    )
     inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
     return inner + 2  # leading/trailing space inside the borders
 
 
 def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "", *, keep_ws: bool = False) -> list[str]:
-    """Wrap panel text; ``keep_ws`` preserves whitespace (command/detail previews)."""
-    kw = dict(replace_whitespace=False, drop_whitespace=False) if keep_ws else dict(break_long_words=False, break_on_hyphens=False)
-    wrapped = textwrap.wrap(text, width=max(8, width), subsequent_indent=subsequent_indent, **kw)
-    return wrapped or [""]
+    """Wrap panel text to ``width`` terminal cells (not Python codepoints)."""
+    width = max(8, width)
+    text = text or ""
+    indent = subsequent_indent or ""
+    cont_budget = max(1, width - _display_width(indent)) if indent else width
+
+    if keep_ws:
+        first_parts = _hard_wrap_cells(text, width)
+        if len(first_parts) <= 1:
+            return first_parts or [""]
+        first = first_parts[0]
+        rest = text[len(first):]
+        cont = _hard_wrap_cells(rest, cont_budget) if rest else []
+        return [first] + ([indent + line for line in cont] if indent else cont)
+
+    # Preserve space runs (palette labels use ``  —  ``); only break on whitespace.
+    tokens = re.findall(r"\S+|\s+", text)
+    if not tokens:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    budget = width
+
+    def flush() -> None:
+        nonlocal current, budget
+        if current:
+            lines.append(current.rstrip(" "))  # drop_whitespace trailing
+            current = ""
+            budget = cont_budget
+
+    for tok in tokens:
+        if tok.isspace():
+            if not current:
+                continue  # drop leading whitespace on a new line
+            # Space runs only commit if a following non-space token also fits;
+            # hold them on current and let the next non-space decide.
+            if _display_width(current) + _display_width(tok) <= budget:
+                current += tok
+            else:
+                flush()
+            continue
+
+        tw = _display_width(tok)
+        if not current:
+            if tw <= budget:
+                current = tok
+            else:
+                chunks = _hard_wrap_cells(tok, budget)
+                lines.extend(chunks[:-1])
+                current = chunks[-1] if chunks else ""
+                if lines:
+                    budget = cont_budget
+            continue
+
+        if _display_width(current) + tw <= budget:
+            current += tok
+        else:
+            flush()
+            if tw <= budget:
+                current = tok
+            else:
+                chunks = _hard_wrap_cells(tok, budget)
+                lines.extend(chunks[:-1])
+                current = chunks[-1] if chunks else ""
+    if current:
+        lines.append(current.rstrip(" "))
+
+    if indent and len(lines) > 1:
+        return [lines[0]] + [indent + ln for ln in lines[1:]]
+    return lines or [""]
 
 
 _wrap_panel_text_keep_ws = functools.partial(_wrap_panel_text, keep_ws=True)
 
 
 def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
-    lines.extend(((border_style, "│ "), (content_style, text.ljust(max(0, box_width - 2))), (border_style, " │\n")))
+    inner = max(0, box_width - 2)
+    lines.extend(((border_style, "│ "), (content_style, _pad_to_width(text, inner)), (border_style, " │\n")))
 
 
 def _append_blank_panel_line(lines, border_style: str, box_width: int) -> None:

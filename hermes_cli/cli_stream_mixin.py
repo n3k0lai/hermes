@@ -249,7 +249,7 @@ class CLIStreamMixin:
         response box is open further reasoning is suppressed — a late thinking block (e.g. after
         an interrupt) would otherwise draw a reasoning box inside the response box.
         """
-        from cli import _DIM, _RST, _cprint
+        from cli import _DIM, _RST, _cprint, _display_width
         if not text:
             return
         self._reasoning_shown_this_turn = True
@@ -259,7 +259,8 @@ class CLIStreamMixin:
             self._reasoning_box_opened = True
             w = self._scrollback_box_width()
             r_label = f" {t('cli.chat.reasoning_label')} "
-            r_fill = w - 2 - len(r_label)
+            # Match the response-box header: measure label in terminal cells.
+            r_fill = w - 2 - _display_width(r_label)
             _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
